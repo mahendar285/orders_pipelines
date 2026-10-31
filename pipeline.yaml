@@ -1,0 +1,38 @@
+# One file owns every knob. The code never hard-codes a path or a threshold.
+paths:
+  data_root: data          # raw/, curated/, quarantine/, runs/, reference/ live here
+
+tables:
+  customers: customers
+  products: products
+  orders: orders
+  order_items: order_items
+  fact: fact_order_line
+
+validation:
+  rules:
+    max_quantity: 1000
+    max_unit_price: 100000.0
+    late_arrival_days: 7
+    future_tolerance_minutes: 15
+    allowed_countries: [US, DE, GB, FR, CA, AU, JP, IN, NL, ES]
+
+write:
+  # Empty list = single flat directory (the baseline path uses this).
+  partition_by: [order_date]
+  compression: snappy
+
+spark:
+  master: "local[2]"
+  conf:
+    spark.sql.shuffle.partitions: 8
+    spark.sql.adaptive.enabled: true
+    spark.sql.adaptive.coalescePartitions.enabled: true
+    spark.sql.autoBroadcastJoinThreshold: 10485760
+    spark.sql.sources.partitionOverwriteMode: dynamic
+    spark.sql.session.timeZone: UTC
+    spark.sql.parquet.compression.codec: snappy
+
+benchmark:
+  rows: 100000
+  repeats: 1

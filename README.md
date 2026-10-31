@@ -1,416 +1,248 @@
-# Order-Line Revenue Pipeline | PySpark Data Engineering
+# Order-line revenue pipeline (PySpark)
 
-### End-to-End Data Engineering Project | Python • PySpark • SQL • Data Quality • Performance Optimization
+A small, tested batch pipeline that turns raw order extracts into an analytics-ready
+`fact_order_line` table. It validates every record, routes bad ones to a queryable
+quarantine zone, makes reruns safe, and measures a naive **baseline** against an
+**optimized** Spark job so the optimisation is evidence, not opinion.
 
-A PySpark-based batch data pipeline designed to transform raw e-commerce data into an analytics-ready `fact_order_line` dataset.
-
-The project demonstrates practical data engineering concepts, including data ingestion, schema validation, data cleaning, transformation, duplicate handling, data quality checks, quarantine management, reconciliation, idempotent processing, and performance optimization.
-
-Developed as a practical project aligned with the **YottaFlex AI Data Engineering / Forward Deployed Engineer challenge**.
-
----
-
-## 🚀 Project Overview
-
-In real-world data engineering environments, raw data often contains missing values, duplicate records, invalid formats, inconsistent data types, and incorrect references.
-
-This project addresses these challenges by implementing an end-to-end PySpark pipeline that:
-
-- Ingests multiple raw CSV datasets.
-- Validates schemas and data types.
-- Identifies missing, invalid, and duplicate records.
-- Separates valid and rejected records.
-- Applies business rules and transformations.
-- Joins customer, product, and order information.
-- Generates an analytics-ready fact table.
-- Performs data quality checks and reconciliation.
-- Compares baseline and optimized Spark execution strategies.
-
-**Main objective:** Build a reliable, traceable, repeatable, and performance-conscious data processing pipeline.
+Built for the *AI Forward Deployed Engineer — Round 2* challenge. Scope is a complete,
+tested vertical slice, not an enterprise platform.
 
 ---
 
-## 🏗️ Pipeline Architecture
+## 1. What problem it solves
 
-```text
-        Raw CSV Datasets
-               |
-               v
-        Data Ingestion
-               |
-               v
-        Schema Validation
-               |
-               v
-        Data Type Conversion
-               |
-               v
-        Data Quality Checks
-               |
-               v
-       Duplicate Detection
-               |
-               v
-    Referential Integrity Checks
-               |
-               v
-      Data Transformation
-               |
-          +----+----+
-          |         |
-          v         v
-     Valid Data   Rejected Data
-          |         |
-          v         v
-    Curated Fact  Quarantine
-       Table       Dataset
-          |
-          v
-   Quality & Reconciliation
-          |
-          v
-   Run Summary and Metrics
+A retail source system drops four CSV extracts (customers, products, orders, order lines)
+into object storage. Analysts need one line-level revenue table they can slice by day,
+segment and category, with numbers that reconcile back to the source and with every
+dropped record still explainable six weeks later.
+
+Everything below exists to keep three promises:
+
+1. **Correct** — derived money columns are deterministic, and the target row count is
+   reconciled against the source row count by an assertion, not by hope.
+2. **Traceable** — no row disappears silently. Rejects keep their payload, reason,
+   source file and `run_id`.
+3. **Repeatable** — the same input run twice produces the same output, and re-running one
+   date does not touch the others.
+
+## 2. Dataset (synthetic, reproducible)
+
+Four sources, one grain each:
+
+- `customers` — one row per customer **version**; grain `customer_id` after de-duplication.
+- `products` — one row per SKU version; grain `sku`.
+- `orders` — one row per order; grain `order_id`.
+- `order_items` — one row per order line; grain `(order_id, line_no)`.
+
+Target `fact_order_line` keeps exactly the `order_items` grain, enriched with customer and
+product attributes and with revenue/margin measures. Full column contracts are in
+[docs/data_dictionary.md](docs/data_dictionary.md).
+
+`src/pipeline/generator.py` produces the data with a fixed seed, including deliberately
+broken records. Expected answers live in a **separate** file
+(`data/reference/expected_labels.csv`), never inside the input, so the tests can check the
+pipeline against the generator's intent.
+
+## 3. Architecture
+
+```
+CSV extracts (customers, products, orders, order_items)
+        |
+        v
+[1] read as text .......... malformed rows -> _corrupt_record
+        |
+        v
+[2] schema contract ....... missing column = fatal run error, extra column = warning + drop
+        |
+        v
+[3] cast to domain types .. cast failure -> quarantine (reason cast_failure:<col>)
+        |
+        v
+[4] business rules ........ first failing rule -> quarantine (reason <rule>)
+        |
+        v
+[5] de-duplicate .......... keep newest per natural key, losers -> quarantine
+        |
+        v
+[6] referential checks .... orphans vs. parents -> quarantine (invalid_reference:<key>)
+        |
+        v
+[7] join + derive ......... dims joined, money columns, bands, late-arrival flag
+        |
+        +--> quarantine/  (reject_reason=..., run_id=...)   parquet
+        |
+        +--> curated/fact_order_line/order_date=YYYY-MM-DD/ parquet
+                        |
+                        v
+             [8] quality checks + reconciliation + run summary (JSON)
 ```
 
----
+Design notes and the why of each step: [docs/architecture.md](docs/architecture.md).
 
-## 📂 Dataset Description
+### Module map
 
-The project uses four reproducible synthetic datasets:
+- `src/pipeline/config.py` — one YAML, one typed handle; no hard-coded paths.
+- `src/pipeline/schemas.py` — every column contract in one file.
+- `src/pipeline/session.py` — the two session profiles the benchmark compares.
+- `src/pipeline/validate.py` — reads, casts, rules, de-duplication, referential checks.
+- `src/pipeline/transform.py` — baseline vs. optimized transformation strategies.
+- `src/pipeline/loader.py` — idempotent writers (fact table, quarantine, summaries).
+- `src/pipeline/quality.py` — post-write assertions and reconciliation.
+- `src/pipeline/metrics.py` — run context: run id, timings, counts, failures.
+- `src/pipeline/generator.py` — seeded synthetic data plus the expected-labels file.
+- `src/pipeline/benchmark.py` — baseline vs. optimized, gated on a matching checksum.
+- `src/pipeline/reconcile.py` — runs the statements in `sql/reconciliation.sql`.
+- `src/pipeline/runner.py` — the orchestration, the only place that knows the order of steps.
+- `src/pipeline/cli.py` — `generate | run | benchmark | reconcile`.
 
-| Dataset | Description | Primary Grain |
-|---|---|---|
-| Customers | Customer information and versions | customer_id |
-| Products | Product and SKU information | sku |
-| Orders | Order-level information | order_id |
-| Order Items | Individual order-line details | order_id, line_no |
+## 4. Quickstart
 
-**Final Output:** `fact_order_line`
-
-The target table retains the order-item grain and enriches each order line with customer and product attributes, revenue measures, and additional analytical fields.
-
-Synthetic data is generated using a fixed random seed, with separate expected labels for validating rejected records.
-
----
-
-## 🛠️ Technology Stack
-
-| Category | Technologies |
-|---|---|
-| Programming | Python |
-| Big Data Processing | Apache PySpark |
-| Database & Querying | SQL |
-| Data Processing | Pandas |
-| Data Storage | CSV, Parquet |
-| Testing | Pytest |
-| Configuration | YAML |
-| Development Tools | VS Code, Git, GitHub |
-
----
-
-## ⚙️ Key Features
-
-### 1. Data Ingestion
-- Reads customer, product, order, and order-item CSV files.
-- Handles malformed records.
-- Validates incoming dataset schemas.
-- Supports configurable input and output paths.
-
-### 2. Data Validation & Quality
-- Checks missing required fields.
-- Validates data types and formats.
-- Identifies invalid quantities and prices.
-- Checks currency, email, and country-code formats.
-- Detects duplicate and conflicting records.
-- Validates parent-child relationships.
-
-### 3. Data Transformation
-- Joins multiple datasets using business keys.
-- Calculates revenue and margin-related measures.
-- Applies business rules.
-- Handles late-arriving records.
-- Produces an analytics-ready fact table.
-
-### 4. Quarantine Management
-Invalid records are stored separately instead of being silently discarded.
-
-The quarantine dataset captures:
-- Source table
-- Rejection reason
-- Record key
-- Source file
-- Original record payload
-- Run ID
-
-This makes rejected records traceable and easier to investigate.
-
-### 5. Idempotency & Reliability
-- Supports safe reruns using run IDs.
-- Prevents duplicate processing during repeated runs.
-- Supports date-based backfills.
-- Replaces only the relevant output partitions.
-- Provides full-refresh functionality.
-
-### 6. Performance Optimization
-
-The project compares two Spark execution strategies.
-
-**Baseline Strategy**
-- AQE disabled.
-- Broadcast joins disabled.
-- Additional repartitioning.
-- Python UDF for revenue-band calculation.
-- Unpartitioned output.
-
-**Optimized Strategy**
-- Adaptive Query Execution enabled.
-- Broadcast joins for smaller dimensions.
-- Early filtering and column selection.
-- Native Spark expressions instead of Python UDFs.
-- Date-partitioned output.
-
-Both strategies are designed to produce equivalent business results, with checksum validation before comparing execution timings.
-
-### 7. Reconciliation & Monitoring
-The pipeline includes checks for:
-- Source and target record counts.
-- Daily revenue totals.
-- Rejected records by reason.
-- Duplicate business keys.
-- Revenue by category or band.
-- Invalid revenue from cancelled or refunded records.
-- Late-arriving records.
-- Target table grain.
-
----
-
-## 🧪 Testing
-
-The project includes a test suite covering 32 test cases.
-
-Test scenarios include:
-
-- Normal data processing.
-- Empty input datasets.
-- Malformed records.
-- Missing required fields.
-- Invalid data types.
-- Exact and conflicting duplicates.
-- Invalid reference keys.
-- Rejected parent records.
-- Late-arriving orders.
-- Idempotent reruns.
-- Date-based backfills.
-- Data reconciliation.
-
-Tests are designed to run locally using a Spark session without requiring a cluster.
-
----
-
-## 📊 Project Structure
-
-```text
-orders-pipeline/
-│
-├── conf/
-│   └── pipeline.yaml
-│
-├── data/
-│   ├── raw/
-│   ├── reference/
-│   ├── curated/
-│   ├── quarantine/
-│   └── runs/
-│
-├── docs/
-│   ├── architecture.md
-│   ├── data_dictionary.md
-│   ├── design_tradeoffs.md
-│   ├── limitations_and_next_steps.md
-│   └── run_evidence.md
-│
-├── sql/
-│   └── reconciliation.sql
-│
-├── src/
-│   └── pipeline/
-│       ├── config.py
-│       ├── schemas.py
-│       ├── session.py
-│       ├── validate.py
-│       ├── transform.py
-│       ├── loader.py
-│       ├── quality.py
-│       ├── metrics.py
-│       ├── generator.py
-│       ├── benchmark.py
-│       ├── reconcile.py
-│       ├── runner.py
-│       └── cli.py
-│
-├── tests/
-├── requirements.txt
-├── Makefile
-└── README.md
-```
-
----
-
-## 💻 Installation & Setup
-
-### Prerequisites
-
-- Python 3.10+
-- JDK 11 or 17
-- Apache Spark through PySpark
-- Git
-
-### Step 1: Clone the Repository
+Requires Python 3.10+ and a JDK 11/17 (Spark needs one).
 
 ```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd orders-pipeline
-```
-
-### Step 2: Create a Virtual Environment
-
-```bash
-python -m venv .venv
-```
-
-Activate it:
-
-**Windows**
-```bash
-.venv\Scripts\activate
-```
-
-**Linux / macOS**
-```bash
-source .venv/bin/activate
-```
-
-### Step 3: Install Dependencies
-
-```bash
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+make sample     # ~2,000 order lines, seeded, with injected defects
+make test       # 32 tests, local Spark, no cluster needed
+make run        # optimized run, writes curated + quarantine + run summary
+make reconcile  # prints the reconciliation report
 ```
 
-### Step 4: Generate Sample Data
+Without make:
 
 ```bash
-make sample
+export PYTHONPATH=src
+python -m pipeline generate --rows 2000 --seed 42
+python -m pipeline run --strategy optimized
+python -m pipeline reconcile
 ```
 
-### Step 5: Run Tests
+Outputs land under `data/`:
 
-```bash
-make test
+```
+data/raw/<table>/<table>.csv          generator output (committed for quick review)
+data/reference/expected_labels.csv    expected reject reasons, kept out of the input
+data/curated/fact_order_line/         partitioned parquet, order_date=YYYY-MM-DD
+data/quarantine/run_id=.../           parquet, partitioned inside by reject_reason
+data/runs/run_id=.../summary.json     operational record of one run
 ```
 
-### Step 6: Execute the Pipeline
+## 5. Baseline vs. optimized
 
-```bash
-make run
-```
+Both strategies run the same validation and produce the **same business rows**; a
+checksum assertion in `benchmark` proves it before any timing is reported.
 
-### Step 7: Run Reconciliation
+- **baseline** — AQE off, broadcast disabled, no column pruning on the fact-to-fact join,
+  Python UDF for the revenue band, one unpartitioned directory, extra `repartition`.
+- **optimized** — AQE on, small dimensions broadcast, early filter + projection, native
+  `when` instead of the UDF, output partitioned by `order_date`, co-partitioned write.
 
-```bash
-make reconcile
-```
+`make benchmark` (100k line items by default, via `src/pipeline/benchmark.py`) prints a
+table with wall-clock time per
+strategy, stage timings, shuffle partition count, join types found in the optimized plan,
+and the output checksum. See [docs/run_evidence.md](docs/run_evidence.md) for the shape of
+that output and how to reproduce it on your machine.
 
-### Step 8: Run Performance Benchmark
+## 6. Data quality and quarantine
 
-```bash
-make benchmark
-```
+Quarantine is one dataset (written to `data/quarantine/run_id=<id>/`, partitioned
+inside by `reject_reason`) with a common schema — `source_table`, `reject_reason`,
+`record_key`, `source_file`, `payload` (JSON of the original record), `raw_row`,
+`run_id` — so a single query answers "what did we drop and why". Reject reasons are stable
+strings suitable for alerting:
 
----
+`malformed_row`, `cast_failure:<column>`, `missing_required:<column>`, `invalid_status`,
+`invalid_currency`, `invalid_quantity`, `quantity_above_limit`, `invalid_unit_price`,
+`unit_price_above_limit`, `invalid_discount_pct`, `invalid_email`, `invalid_country_code`,
+`invalid_unit_cost`, `future_timestamp`, `duplicate_exact`, `duplicate_key_conflict`,
+`invalid_reference:<key>`.
 
-## 📁 Pipeline Outputs
+Rejections cascade in a documented order: a line whose parent order was rejected becomes
+`invalid_reference:order_id` rather than silently surviving.
 
-The pipeline generates the following outputs:
+## 7. Idempotency, retry and backfill
 
-| Output | Purpose |
-|---|---|
-| `data/curated/fact_order_line/` | Final analytics-ready Parquet dataset |
-| `data/quarantine/` | Rejected records and rejection reasons |
-| `data/runs/` | Run summaries and operational metrics |
-| `data/reference/` | Expected labels for validation |
-| `data/raw/` | Synthetic source datasets |
+- Writes use `partitionOverwriteMode=dynamic`, so a rerun replaces exactly the
+  `order_date` partitions it produced.
+- A rerun with the same `run_id` is a no-op unless `--force` is passed; the previous
+  summary is returned instead of duplicating work.
+- Quarantine for a `run_id` is purged before rewriting, so a retried run cannot leave two
+  generations of rejects behind.
+- Backfilling one date re-runs that date's slice only; other partitions are untouched.
+- `--full-refresh` deletes the curated table for a clean rebuild (use when the
+  transformation itself changed).
 
-These outputs support data quality analysis, reconciliation, troubleshooting, and performance evaluation.
+## 8. Testing
 
----
+`make test` runs 32 tests on a local Spark session (about 60–90 s):
 
-## 📈 Performance Evaluation
+- happy path, amounts, rounding, band boundaries;
+- empty input, malformed rows, missing required fields, wrong dtypes;
+- exact and conflicting duplicates; out-of-order dimension versions;
+- unknown reference keys and items belonging to a rejected parent order;
+- late-arriving orders; rerun idempotency; single-date backfill;
+- generator labels reconciled against quarantine; count reconciliation asserted.
 
-The project includes a benchmark module to compare baseline and optimized Spark execution.
+## 9. Reconciliation
 
-Performance evaluation considers:
+`make reconcile` registers the curated and quarantine views and runs the named statements
+in `sql/reconciliation.sql`: row counts per `order_date`, daily net revenue, rejects by
+reason, duplicate-key check, revenue by band, a void-status revenue leak check, late-arrival
+share, and a grain check. Nothing here is a screenshot — it is re-runnable output.
 
-- Execution time.
-- Stage timings.
-- Shuffle partition count.
-- Join strategy.
-- Execution plan.
-- Output checksum.
+## 10. Assumptions
 
-The benchmark validates output equivalence before reporting timing differences.
+- All timestamps are UTC ISO-8601 (`yyyy-MM-dd'T'HH:mm:ss'Z'`); no local-time conversion.
+- Money is `double` at source; rounding happens once per derived column to 2 dp. A
+  production system should use `decimal(18,2)`.
+- One currency per order, already normalised upstream — no FX conversion in scope.
+- `CANCELLED` and `REFUNDED` lines are **retained** for audit with
+  `net_revenue_amount = 0`; they are excluded from revenue, not from history.
+- Dimension "latest version" is chosen by `updated_at`; ties break on source file name.
+  This is a latest-version snapshot, not a full SCD2 history (see next steps).
+- The pipeline owns the curated path; no other writer touches it.
 
-Actual performance results should be generated by running the benchmark in the target environment.
+## 11. Known limitations
 
----
+- Plain parquet, so rerun safety comes from dynamic partition overwrite rather than a
+  transactional table. Delta Lake / Iceberg would remove the purge workarounds.
+- Counting between stages costs extra passes (each `count()` is a Spark job). Fine at
+  these volumes, worth replacing with accumulator-free metrics or a persisted cache at 10x.
+- The benchmark measures wall-clock and plan shape, not shuffle bytes; exact shuffle
+  read/write figures come from the Spark UI at `localhost:4040` for the same run.
+- Local mode only out of the box. Paths are config-driven, so pointing `paths.*` at a
+  bucket is a config change, but the `shutil` purge in `--full-refresh` is filesystem-only.
+- No SCD2 history, no FX, no streaming. Named deliberately — see
+  [docs/limitations_and_next_steps.md](docs/limitations_and_next_steps.md).
 
-## 🔍 Engineering Concepts Demonstrated
+## 12. Naming conventions
 
-- End-to-end ETL pipeline development.
-- Distributed data processing with PySpark.
-- Schema enforcement and data validation.
-- Data quality and error handling.
-- Referential integrity.
-- Duplicate detection and resolution.
-- Idempotent data processing.
-- Retry and backfill strategies.
-- Data reconciliation.
-- Logging and operational metrics.
-- Spark performance optimization.
-- Automated testing.
-- Modular and configurable pipeline design.
+- `snake_case` everywhere; tables singular and explicit (`fact_order_line`).
+- Stable deterministic business keys only (`customer_id`, `sku`, `order_id`, `line_no`)
+  — no surrogate keys generated inside the pipeline.
+- Timestamps end in `_ts` (UTC, ISO-8601); dates end in `_date`; amounts end in
+  `_amount`; ratios end in `_pct` and are stored as fractions (0.15 = 15%).
+- Provenance columns are explicit and not underscore-prefixed in the target:
+  `run_id`, `source_file`, `ingested_at`. Helper columns used during processing are
+  prefixed with `_` and always dropped before the write.
+- Reject reasons are `snake_case`, `<rule>` or `<rule>:<column>`, and never reworded
+  between releases (tests pin them).
 
----
+## 13. Challenge coverage
 
-## ⚠️ Limitations & Future Improvements
+Every numbered implementation step maps to something runnable:
 
-- Introduce Delta Lake or Apache Iceberg for transactional data management.
-- Add SCD Type 2 dimension history.
-- Implement streaming data ingestion.
-- Add cloud object storage integration.
-- Improve performance monitoring with Spark UI metrics.
-- Extend the pipeline for larger production datasets.
-
----
-
-## 🎯 Project Objective
-
-This project demonstrates my interest in solving practical data engineering problems through reliable data processing, validation, optimization, and analytical data publishing.
-
-It reflects my learning and hands-on work in Python, PySpark, SQL, data quality, and end-to-end pipeline development.
-
----
-
-## 👨‍💻 Author
-
-**K. Mahender Reddy**
-
-B.Tech – Computer Science and Engineering (AI & ML)  
-Malla Reddy University
-
-- 💻 GitHub: https://github.com/mahendar285
-- 🌍 Portfolio: https://mahender-reddy-portfolio.base44.app
-- 📧 Email: kmahendarredd2005@gmail.com
-
----
-
-⭐ If you find this project useful, feel free to explore the repository and connect with me.
+1. README + data dictionary + architecture — this file and `docs/`.
+2. Core pipeline with modules and configurable paths — `src/pipeline/`, `conf/pipeline.yaml`.
+3. Schema validation, rules, duplicates, quarantine — `src/pipeline/validate.py`.
+4. Logging and run metrics — `src/pipeline/metrics.py`, `data/runs/run_id=*/summary.json`.
+5. Automated tests, six edge-case families — `tests/`.
+6. Idempotent load, retry and backfill behaviour — `src/pipeline/loader.py`, section 7.
+7. Reproducible sample data with labels kept apart — `src/pipeline/generator.py`.
+8. Output correctness with reconciliation queries — `sql/reconciliation.sql`,
+   `src/pipeline/reconcile.py`.
+9. Performance measurement and one optimisation — `src/pipeline/benchmark.py`, section 5.
+10. Source, tests, sample data, docs, trade-offs — the repository itself plus
+    `docs/design_tradeoffs.md`.
